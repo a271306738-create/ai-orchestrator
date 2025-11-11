@@ -1,6 +1,7 @@
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
+import { Octokit } from "@octokit/rest";
 
 dotenv.config();
 
@@ -10,8 +11,18 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// ================== OpenAI 通用调用 ==================
+// ===== GitHub / auto-dev 配置 =====
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_REPO_OWNER = process.env.GITHUB_REPO_OWNER;
+const GITHUB_REPO_NAME = process.env.GITHUB_REPO_NAME;
+const GITHUB_DEFAULT_BRANCH = process.env.GITHUB_DEFAULT_BRANCH || "main";
 
+const octokit =
+  GITHUB_TOKEN && GITHUB_REPO_OWNER && GITHUB_REPO_NAME
+    ? new Octokit({ auth: GITHUB_TOKEN })
+    : null;
+
+// ===== OpenAI 通用调用 =====
 async function callOpenAI(messages) {
   if (!OPENAI_API_KEY) {
     throw new Error("缺少 OPENAI_API_KEY 环境变量");
@@ -33,7 +44,6 @@ async function callOpenAI(messages) {
       }
     );
 
-    console.log("OpenAI 调用成功");
     return res.data.choices[0].message.content.trim();
   } catch (err) {
     console.error("OpenAI 调用出错：", err.response?.data || err.message);
@@ -41,15 +51,9 @@ async function callOpenAI(messages) {
   }
 }
 
-// ================== 简易长期记忆（内存版 Demo） ==================
-// 真正上线可以换成数据库；这里先证明机制。
-
-// 只存「你明确要求记住的东西」
+// ===== 简易长期记忆（内存版） =====
 let orchestratorMemory = [];
 
-/**
- * 从记忆生成一段提示词，加到 system prompt 里
- */
 function buildMemoryPrompt() {
   if (!orchestratorMemory.length) return "";
   return (
@@ -59,17 +63,10 @@ function buildMemoryPrompt() {
   );
 }
 
-/**
- * 解析“记住：xxx”指令，把 xxx 写入长期记忆
- * 用法示例：
- *   记住：主账号是杰尼龟龟，粉丝 20-30 岁女性为主，风格要搞笑真诚。
- */
 function tryUpdateMemoryFromHistory(history) {
-  if (!Array.isArray(history) || history.length === 0) return;
-
+  if (!Array.isArray(history) || !history.length) return;
   const last = history[history.length - 1];
   if (!last || typeof last.content !== "string") return;
-
   const text = last.content.trim();
   if (text.startsWith("记住：") || text.startsWith("记住:")) {
     const note = text.replace(/^记住[:：]/, "").trim();
@@ -80,8 +77,87 @@ function tryUpdateMemoryFromHistory(history) {
   }
 }
 
-// ================== 首页：控制台 UI ==================
+// ===== auto-dev：根据 patch 创建 PR（只改标记区） =====
+async function createAutoDevPR(patch, title, body) {
+  if (!octokit) {
+    throw new Error("未配置 GitHub 自动开发所需环境变量");
+  }
 
+  const { filePath, markerStart, markerEnd, newContent } = patch;
+  if (!filePath || !markerStart || !markerEnd || !newContent) {
+    throw new Error("patch 对象缺少必要字段");
+  }
+
+  // 1. 获取主分支最新 commit
+  const { data: baseRef } = await octokit.git.getRef({
+    owner: GITHUB_REPO_OWNER,
+    repo: GITHUB_REPO_NAME,
+    ref: `heads/${GITHUB_DEFAULT_BRANCH}`
+  });
+  const baseSha = baseRef.object.sha;
+
+  // 2. 创建新分支
+  const branchName = `auto-dev-${Date.now()}`;
+  await octokit.git.createRef({
+    owner: GITHUB_REPO_OWNER,
+    repo: GITHUB_REPO_NAME,
+    ref: `refs/heads/${branchName}`,
+    sha: baseSha
+  });
+
+  // 3. 获取要修改的文件内容
+  const { data: fileData } = await octokit.repos.getContent({
+    owner: GITHUB_REPO_OWNER,
+    repo: GITHUB_REPO_NAME,
+    path: filePath,
+    ref: GITHUB_DEFAULT_BRANCH
+  });
+
+  if (Array.isArray(fileData)) {
+    throw new Error("给定路径是目录不是文件");
+  }
+
+  const original = Buffer.from(fileData.content, "base64").toString("utf8");
+
+  const startIndex = original.indexOf(markerStart);
+  const endIndex = original.indexOf(markerEnd);
+
+  if (startIndex === -1 || endIndex === -1) {
+    throw new Error("未找到指定的 markerStart 或 markerEnd");
+  }
+
+  const before = original.slice(0, startIndex + markerStart.length);
+  const after = original.slice(endIndex);
+
+  const updated = `${before}
+${newContent.trim()}
+${after}`;
+
+  // 4. 在新分支更新文件
+  await octokit.repos.createOrUpdateFileContents({
+    owner: GITHUB_REPO_OWNER,
+    repo: GITHUB_REPO_NAME,
+    path: filePath,
+    message: title,
+    content: Buffer.from(updated, "utf8").toString("base64"),
+    branch: branchName,
+    sha: fileData.sha
+  });
+
+  // 5. 创建 PR
+  const { data: pr } = await octokit.pulls.create({
+    owner: GITHUB_REPO_OWNER,
+    repo: GITHUB_REPO_NAME,
+    title,
+    head: branchName,
+    base: GITHUB_DEFAULT_BRANCH,
+    body
+  });
+
+  return pr.html_url;
+}
+
+// ===== 首页：控制台（含 AUTO-DEV 标记区） =====
 app.get("/", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!DOCTYPE html>
@@ -169,16 +245,18 @@ app.get("/", (req, res) => {
 </head>
 <body>
   <div class="wrap">
+    <!-- === AUTO-DEV UI START === -->
     <h1>AI Orchestrator 控制台 🚀</h1>
     <p class="desc">
       我是你的「模板研发总监 + 技术顾问」。在这里让我帮你：直播话术模板、选品 SOP、AI 子代理分工、流程文档、功能路线图等。<br/>
-      提示：输入「记住：xxx」可以写入长期记忆，比如「记住：主账号是杰尼龟龟，粉丝以 20-30 岁女生为主」。
+      提示：输入「记住：xxx」可以写入长期记忆，比如「记住：主账号是XXX」。
     </p>
 
     <div id="chat"></div>
     <textarea id="input" rows="3" placeholder="输入你的指令，Enter 发送，Shift+Enter 换行"></textarea>
     <button id="send">发送</button>
-    <p><small>对话只存在本页，刷新会清空；长期记忆由「记住：」指令单独保存（当前为内存版 Demo，服务重启会清空）。 · /demo 可查看功能路线图示例。</small></p>
+    <p><small>对话只存在本页，刷新会清空；长期记忆由「记住：」指令单独保存（当前为内存版 Demo）。 · 输入 /auto-dev + 需求 可让系统为你生成改 UI 的 PR。</small></p>
+    <!-- === AUTO-DEV UI END === -->
   </div>
 
   <script>
@@ -250,8 +328,7 @@ app.get("/", (req, res) => {
 </html>`);
 });
 
-// ================== /chat：带长期记忆的助手 ==================
-
+// ===== /chat：对话 + 记忆 + auto-dev =====
 app.post("/chat", async (req, res) => {
   try {
     const clientHistory = Array.isArray(req.body.history)
@@ -264,56 +341,84 @@ app.post("/chat", async (req, res) => {
         ? last.content.trim()
         : "";
 
-    // 1）如果是「记住：xxx」，写入长期记忆，然后继续正常回答
-    if (lastText.startsWith("记住：") || lastText.startsWith("记住:")) {
-      const note = lastText.replace(/^记住[:：]/, "").trim();
-      if (note) {
-        orchestratorMemory.push(note);
-        console.log("✅ 已写入长期记忆：", note);
-      }
-      // 不单独返回提示，让下面的正常逻辑一起跑，这样它会带着新记忆回答
-    }
+    // 处理记忆写入（记住：xxx）
+    tryUpdateMemoryFromHistory(clientHistory);
 
-    // 2）如果是 "/auto-dev" 指令，切换成开发工程师模式
+    // 处理 /auto-dev 指令：让 AI 生成 patch，并自动创建 PR
     if (lastText.startsWith("/auto-dev")) {
-      const demand = lastText.replace("/auto-dev", "").trim() || 
-        "请基于当前 AI Orchestrator 项目（Express + /chat + /demo + 控制台页面），提出下一步可以自动化实现的功能和 UI 改造方案，并给出对应的代码修改建议。";
+      const demand =
+        lastText.replace("/auto-dev", "").trim() ||
+        "请基于当前项目，对 AUTO-DEV UI 区块做一次合理改造，并生成对应的补丁。";
 
-      const devReply = await callOpenAI([
+      const patchAnswer = await callOpenAI([
         {
           role: "system",
           content:
-            buildMemoryPrompt() +
-            "你是这个项目的『AI 开发工程师 + 架构师』。" +
-            "目标：根据老板的指令，帮当前项目设计可以直接落地的改动，包括新增接口、修改 index.js、调整前端 UI、增加长期记忆存储等。" +
-            "必须输出清晰的：改动说明、涉及的文件路径、关键代码片段（用```标记）。" +
-            "禁止擅自执行部署或转账等高风险操作，如有敏感操作，标记为【需要人工确认】。"
+            "你是这个项目的『AI 开发工程师』。" +
+            "请根据用户需求，生成一个 JSON 对象（不要任何多余文字），字段为：" +
+            "{ \"filePath\": \"index.js\", " +
+            "\"markerStart\": \"<!-- === AUTO-DEV UI START === -->\", " +
+            "\"markerEnd\": \"<!-- === AUTO-DEV UI END === -->\", " +
+            "\"newContent\": \"这里填入新的 HTML 片段（不含 marker 本身）\" }。" +
+            "newContent 内部的换行和引号请转义为合法 JSON 字符串。" +
+            "只允许修改 marker 包裹的区域，禁止动其他代码。"
         },
-        ...clientHistory
+        { role: "user", content: demand }
       ]);
 
-      console.log("✅ Auto-dev reply:", devReply);
-      return res.json({ reply: devReply });
+      let patch;
+      try {
+        const jsonMatch = patchAnswer.match(/\{[\s\S]*\}/);
+        patch = JSON.parse(jsonMatch ? jsonMatch[0] : patchAnswer);
+      } catch (e) {
+        console.error("解析 auto-dev JSON 失败：", e, patchAnswer);
+        return res.json({
+          reply:
+            "【auto-dev 提示】AI 没按 JSON 格式返回 patch，请重试或收紧提示词。原始输出：\n" +
+            patchAnswer
+        });
+      }
+
+      try {
+        const prUrl = await createAutoDevPR(
+          patch,
+          "AI auto-dev: UI update",
+          `Auto-generated patch based on demand: ${demand}`
+        );
+
+        return res.json({
+          reply:
+            "✅ 已根据你的指令生成自动开发 PR，请到 GitHub 审核合并：\n" +
+            prUrl
+        });
+      } catch (e) {
+        console.error("创建 auto-dev PR 失败：", e.message);
+        return res.json({
+          reply:
+            "❌ auto-dev 执行失败：" +
+            e.message +
+            "。\n请检查环境变量和标记注释是否存在。"
+        });
+      }
     }
 
-    // 3）默认：作为「模板研发总监 + 技术负责人」正常对话
+    // 默认：模板研发总监 + 技术负责人
     const messages = [
       {
         role: "system",
         content:
           buildMemoryPrompt() +
           "你是一个高级『模板研发总监 + 技术负责人 + 业务顾问』，服务对象是一位做直播电商与多项目的老板。" +
-          "你的职责：1）帮他设计标准化模板（直播话术、选品 SOP、AI 子代理职责、流程文档）；" +
-          "2）同时作为 AI Orchestrator 项目的技术负责人，主动提出可以实现的新功能、接口设计和代码补丁草稿；" +
-          "3）所有会影响真实资金、账号安全、外部系统写操作的功能，必须标记为【需要人工确认】并给出风险说明；" +
-          "输出要求：结构清晰、可执行、语言简洁，不要废话。"
+          "你的职责：1）设计标准化模板（直播话术、选品 SOP、AI 子代理职责、流程文档）；" +
+          "2）提出可实现的系统功能和 API 设计；" +
+          "3）涉及真实资金、账号或写操作的建议标记为【需要人工确认】并说明风险；" +
+          "输出要求：结构清晰、可执行、语言简洁。"
       },
       ...clientHistory
     ];
 
     const reply = await callOpenAI(messages);
-    console.log("✅ Chat reply:", reply);
-    res.json({ reply });
+    return res.json({ reply });
   } catch (err) {
     console.error("Chat 出错：", err.response?.data || err.message);
     res.status(500).json({
@@ -323,16 +428,7 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-    console.error("Chat 出错：", err.response?.data || err.message);
-    res.status(500).json({
-      error: "Chat 出错",
-      detail: err.response?.data?.error?.message || err.message
-    });
-  }
-});
-
-// ================== /demo：功能路线图示例 ==================
-
+// ===== /demo：功能路线图示例 =====
 app.get("/demo", async (req, res) => {
   try {
     const reply = await callOpenAI([
@@ -343,15 +439,8 @@ app.get("/demo", async (req, res) => {
       {
         role: "user",
         content:
-          "你是 AI Orchestrator 项目的技术负责人，熟悉当前系统：Express + /chat + /demo 的基础结构。" +
-          "根据这些，提出 3-7 个下一步可以实现的功能，用于帮助直播电商老板：" +
-          "包括选品决策、话术生成、数据分析、多代理协作等。" +
-          "每个功能包含：名称、作用、对应的 API 路径设计、是否涉及敏感操作（如资金/账号/数据写入）。"
-      },
-      {
-        role: "user",
-        content:
-          "请输出一个「功能路线图」，按优先级排序，格式清晰，方便我选择要先实现哪几个。"
+          "你是 AI Orchestrator 项目的技术负责人，熟悉当前系统结构。" +
+          "请提出 3-7 个下一步可以实现的功能，每个包含：名称、作用、API 路径、是否涉及敏感操作。"
       }
     ]);
 
@@ -368,8 +457,7 @@ app.get("/demo", async (req, res) => {
   }
 });
 
-// ================== 启动服务 ==================
-
+// ===== 启动服务 =====
 app.listen(PORT, () => {
   console.log(`AI Orchestrator running on port ${PORT}`);
 });

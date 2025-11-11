@@ -156,9 +156,11 @@ app.post("/chat", async (req, res) => {
       {
         role: "system",
         content:
-          "你是一个高级『模板研发总监 + 业务顾问』，服务对象是一位做直播电商与多项目的老板。" +
-          "目标：帮他设计标准化模板（直播话术、选品SOP、AI子代理职责、流程文档）。" +
-          "要求：结构清晰、可执行、语言简洁、别太书面。"
+          "你是一个高级『模板研发总监 + 技术负责人 + 业务顾问』，服务对象是一位做直播电商与多项目的老板。" +
+          "你的职责：1）帮他设计标准化模板（直播话术、选品SOP、AI子代理职责、流程文档）；" +
+          "2）同时作为 AI Orchestrator 项目的技术负责人，主动提出可以实现的新功能、接口设计和代码补丁草稿；" +
+          "3）所有会影响真实资金、账号安全、外部系统写操作的功能，必须标记为【需要人工确认】并给出风险说明；" +
+          "输出要求：结构清晰、可执行、语言简洁，不要废话。。"
       },
       ...clientHistory
     ];
@@ -183,17 +185,24 @@ app.get("/demo", async (req, res) => {
       },
       {
         role: "user",
-        content: "简要说明这个AI Orchestrator可以帮主播老板做什么。控制在120字内。"
+        content: "你是 AI Orchestrator 项目的技术负责人，熟悉当前系统：Express + /chat + /demo 的基础结构。" +
+          "根据这些，提出3-7个下一步可以实现的功能，用于帮助直播电商老板：包括选品决策、话术生成、数据分析、多代理协作等。" +
+          "每个功能包含：名称、作用、对应的API路径设计、是否涉及敏感操作（如资金/账号/数据写入）。"
+      }
+    ]);
+        role: "user",
+        content:
+          "请输出一个「功能路线图」，按优先级排序，格式清晰，方便我选择要先实现哪几个。"
       }
     ]);
 
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.send("【Demo 测试成功】\n" + reply + "\n");
+    res.send("【Orchestrator 功能建议】\n" + reply + "\n");
   } catch (err) {
     res
       .status(500)
       .send(
-        "Demo 出错： " +
+        "获取功能建议出错： " +
           (err.response?.data?.error?.message || err.message)
       );
   }

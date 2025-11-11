@@ -258,9 +258,45 @@ app.post("/chat", async (req, res) => {
       ? req.body.history
       : [];
 
-    // 如果最后一句是「记住：xxx」，写入长期记忆
-    tryUpdateMemoryFromHistory(clientHistory);
+    const last = clientHistory[clientHistory.length - 1];
+    const lastText =
+      last && typeof last.content === "string"
+        ? last.content.trim()
+        : "";
 
+    // 1）如果是「记住：xxx」，写入长期记忆，然后继续正常回答
+    if (lastText.startsWith("记住：") || lastText.startsWith("记住:")) {
+      const note = lastText.replace(/^记住[:：]/, "").trim();
+      if (note) {
+        orchestratorMemory.push(note);
+        console.log("✅ 已写入长期记忆：", note);
+      }
+      // 不单独返回提示，让下面的正常逻辑一起跑，这样它会带着新记忆回答
+    }
+
+    // 2）如果是 "/auto-dev" 指令，切换成开发工程师模式
+    if (lastText.startsWith("/auto-dev")) {
+      const demand = lastText.replace("/auto-dev", "").trim() || 
+        "请基于当前 AI Orchestrator 项目（Express + /chat + /demo + 控制台页面），提出下一步可以自动化实现的功能和 UI 改造方案，并给出对应的代码修改建议。";
+
+      const devReply = await callOpenAI([
+        {
+          role: "system",
+          content:
+            buildMemoryPrompt() +
+            "你是这个项目的『AI 开发工程师 + 架构师』。" +
+            "目标：根据老板的指令，帮当前项目设计可以直接落地的改动，包括新增接口、修改 index.js、调整前端 UI、增加长期记忆存储等。" +
+            "必须输出清晰的：改动说明、涉及的文件路径、关键代码片段（用```标记）。" +
+            "禁止擅自执行部署或转账等高风险操作，如有敏感操作，标记为【需要人工确认】。"
+        },
+        ...clientHistory
+      ]);
+
+      console.log("✅ Auto-dev reply:", devReply);
+      return res.json({ reply: devReply });
+    }
+
+    // 3）默认：作为「模板研发总监 + 技术负责人」正常对话
     const messages = [
       {
         role: "system",
@@ -279,6 +315,14 @@ app.post("/chat", async (req, res) => {
     console.log("✅ Chat reply:", reply);
     res.json({ reply });
   } catch (err) {
+    console.error("Chat 出错：", err.response?.data || err.message);
+    res.status(500).json({
+      error: "Chat 出错",
+      detail: err.response?.data?.error?.message || err.message
+    });
+  }
+});
+
     console.error("Chat 出错：", err.response?.data || err.message);
     res.status(500).json({
       error: "Chat 出错",

@@ -10,7 +10,8 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// 通用：调用 OpenAI（支持多轮，带超时和错误日志）
+// ================== OpenAI 通用调用 ==================
+
 async function callOpenAI(messages) {
   if (!OPENAI_API_KEY) {
     throw new Error("缺少 OPENAI_API_KEY 环境变量");
@@ -40,9 +41,47 @@ async function callOpenAI(messages) {
   }
 }
 
+// ================== 简易长期记忆（内存版 Demo） ==================
+// 真正上线可以换成数据库；这里先证明机制。
+
+// 只存「你明确要求记住的东西」
+let orchestratorMemory = [];
+
 /**
- * 首页：带聊天框的 Orchestrator 控制台
+ * 从记忆生成一段提示词，加到 system prompt 里
  */
+function buildMemoryPrompt() {
+  if (!orchestratorMemory.length) return "";
+  return (
+    "以下是该老板的长期设定和偏好，在回答任何问题时都应默认遵守：\n" +
+    orchestratorMemory.map((m, i) => `${i + 1}. ${m}`).join("\n") +
+    "\n"
+  );
+}
+
+/**
+ * 解析“记住：xxx”指令，把 xxx 写入长期记忆
+ * 用法示例：
+ *   记住：主账号是杰尼龟龟，粉丝 20-30 岁女性为主，风格要搞笑真诚。
+ */
+function tryUpdateMemoryFromHistory(history) {
+  if (!Array.isArray(history) || history.length === 0) return;
+
+  const last = history[history.length - 1];
+  if (!last || typeof last.content !== "string") return;
+
+  const text = last.content.trim();
+  if (text.startsWith("记住：") || text.startsWith("记住:")) {
+    const note = text.replace(/^记住[:：]/, "").trim();
+    if (note) {
+      orchestratorMemory.push(note);
+      console.log("✅ 已写入长期记忆：", note);
+    }
+  }
+}
+
+// ================== 首页：控制台 UI ==================
+
 app.get("/", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!DOCTYPE html>
@@ -133,13 +172,13 @@ app.get("/", (req, res) => {
     <h1>AI Orchestrator 控制台 🚀</h1>
     <p class="desc">
       我是你的「模板研发总监 + 技术顾问」。在这里让我帮你：直播话术模板、选品 SOP、AI 子代理分工、流程文档、功能路线图等。<br/>
-      可以直接输入：比如「帮我写一套直播开场白模板」「帮我设计 3 个 AI 子代理各自的职责」。
+      提示：输入「记住：xxx」可以写入长期记忆，比如「记住：主账号是杰尼龟龟，粉丝以 20-30 岁女生为主」。
     </p>
 
     <div id="chat"></div>
     <textarea id="input" rows="3" placeholder="输入你的指令，Enter 发送，Shift+Enter 换行"></textarea>
     <button id="send">发送</button>
-    <p><small>对话只存在本页，刷新会清空。重要内容请复制到你自己的文档保存。 · /demo 可查看功能路线图示例。</small></p>
+    <p><small>对话只存在本页，刷新会清空；长期记忆由「记住：」指令单独保存（当前为内存版 Demo，服务重启会清空）。 · /demo 可查看功能路线图示例。</small></p>
   </div>
 
   <script>
@@ -161,13 +200,11 @@ app.get("/", (req, res) => {
       const text = inputEl.value.trim();
       if (!text) return;
 
-      // 显示用户消息 & 写入历史
       append('user', text);
       history.push({ role: 'user', content: text });
       inputEl.value = '';
       inputEl.focus();
 
-      // loading 提示
       sendBtn.disabled = true;
       const thinking = document.createElement('div');
       thinking.className = 'msg ai';
@@ -204,7 +241,6 @@ app.get("/", (req, res) => {
       }
     });
 
-    // 初始欢迎语
     append(
       'assistant',
       '我是你的 AI 模板研发总监。先说一件你最想标准化或自动化的事情，我帮你拆成步骤和可实现的功能。'
@@ -214,19 +250,22 @@ app.get("/", (req, res) => {
 </html>`);
 });
 
-/**
- * /chat：处理首页聊天请求
- */
+// ================== /chat：带长期记忆的助手 ==================
+
 app.post("/chat", async (req, res) => {
   try {
     const clientHistory = Array.isArray(req.body.history)
       ? req.body.history
       : [];
 
+    // 如果最后一句是「记住：xxx」，写入长期记忆
+    tryUpdateMemoryFromHistory(clientHistory);
+
     const messages = [
       {
         role: "system",
         content:
+          buildMemoryPrompt() +
           "你是一个高级『模板研发总监 + 技术负责人 + 业务顾问』，服务对象是一位做直播电商与多项目的老板。" +
           "你的职责：1）帮他设计标准化模板（直播话术、选品 SOP、AI 子代理职责、流程文档）；" +
           "2）同时作为 AI Orchestrator 项目的技术负责人，主动提出可以实现的新功能、接口设计和代码补丁草稿；" +
@@ -248,9 +287,8 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-/**
- * /demo：功能路线图示例（确认 OpenAI 是否正常）
- */
+// ================== /demo：功能路线图示例 ==================
+
 app.get("/demo", async (req, res) => {
   try {
     const reply = await callOpenAI([
@@ -286,7 +324,8 @@ app.get("/demo", async (req, res) => {
   }
 });
 
-// 启动服务
+// ================== 启动服务 ==================
+
 app.listen(PORT, () => {
   console.log(`AI Orchestrator running on port ${PORT}`);
 });

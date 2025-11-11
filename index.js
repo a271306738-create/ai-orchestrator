@@ -10,7 +10,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// 通用：调用 OpenAI（传入 messages，支持多轮对话）
+// 通用：调用 OpenAI（支持多轮，带超时和错误日志）
 async function callOpenAI(messages) {
   if (!OPENAI_API_KEY) {
     throw new Error("缺少 OPENAI_API_KEY 环境变量");
@@ -28,9 +28,10 @@ async function callOpenAI(messages) {
           Authorization: `Bearer ${OPENAI_API_KEY}`,
           "Content-Type": "application/json"
         },
-        timeout: 30000
+        timeout: 20000
       }
     );
+
     console.log("OpenAI 调用成功");
     return res.data.choices[0].message.content.trim();
   } catch (err) {
@@ -40,8 +41,7 @@ async function callOpenAI(messages) {
 }
 
 /**
- * 首页：一个简易聊天界面
- * 在这里你可以直接跟「模板研发总监」对话，讨论直播话术、选品 SOP、AI 工人流程等。
+ * 首页：简易聊天控制台
  */
 app.get("/", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -51,29 +51,155 @@ app.get("/", (req, res) => {
   <meta charset="UTF-8" />
   <title>AI Orchestrator 控制台</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, system-ui; margin: 0; padding: 0; background: #0f172a; color: #e5e7eb; }
-    .wrap { max-width: 800px; margin: 0 auto; padding: 20px; }
-    h1 { font-size: 22px; margin-bottom: 8px; }
-    p.desc { font-size: 13px; color: #9ca3af; margin-top: 0; margin-bottom: 16px; }
-    #chat { border-radius: 10px; padding: 12px; background: #020817; height: 480px; overflow-y: auto; font-size: 14px; border: 1px solid #111827; }
-    .msg { margin-bottom: 8px; line-height: 1.5; white-space: pre-wrap; }
-    .user { color: #38bdf8; }
-    .ai { color: #a5b4fc; }
-    #input { width: 100%; box-sizing: border-box; margin-top: 10px; padding: 8px; border-radius: 8px; border: 1px solid #111827; background: #020817; color: #e5e7eb; font-size: 14px; }
-    #send { margin-top: 8px; padding: 8px 16px; border-radius: 999px; border: none; background: #38bdf8; color: #020817; font-weight: 600; cursor: pointer; font-size: 14px; }
-    #send:disabled { opacity: .5; cursor: default; }
-    small { color: #6b7280; font-size: 11px; }
+    body { font-family: -apple-system,BlinkMacSystemFont,system-ui; margin:0; padding:0; background:#020817; color:#e5e7eb; }
+    .wrap { max-width:800px; margin:0 auto; padding:20px; }
+    h1 { font-size:22px; margin-bottom:6px; }
+    p.desc { font-size:13px; color:#9ca3af; margin:0 0 12px 0; }
+    #chat { border-radius:10px; padding:10px; background:#020817; height:460px; overflow-y:auto; font-size:14px; border:1px solid #111827; }
+    .msg { margin-bottom:8px; line-height:1.5; white-space:pre-wrap; }
+    .user { color:#38bdf8; }
+    .ai { color:#a5b4fc; }
+    #input { width:100%; box-sizing:border-box; margin-top:8px; padding:8px; border-radius:8px; border:1px solid:#111827; background:#020817; color:#e5e7eb; font-size:14px; }
+    #send { margin-top:6px; padding:8px 16px; border-radius:999px; border:none; background:#38bdf8; color:#020817; font-weight:600; cursor:pointer; font-size:14px; }
+    #send:disabled { opacity:.5; cursor:default; }
+    small { color:#6b7280; font-size:10px; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>AI Orchestrator 控制台 🚀</h1>
     <p class="desc">
-      这里的 AI 角色默认是「模板研发总监 + 业务顾问」：帮你设计直播话术模板、选品SOP、AI子代理流程。
-      直接用中文跟它聊，比如：<br>
-      「帮我设计一个直播开场白模版」<br>
-      「帮我做一个选品决策表的结构」<br>
-      「帮我规划3个AI子代理分别负责什么」
+      我是你的「模板研发总监 + 业务顾问」。在这里让我帮你：直播话术模版、选品SOP、AI子代理分工、流程文档等。<br/>
+      直接输入：比如「帮我写一套直播开场白模版」「帮我设计3个AI子代理各自的职责」。
     </p>
 
-    <div
+    <div id="chat"></div>
+    <textarea id="input" rows="3" placeholder="输入你的指令，Enter 发送，Shift+Enter 换行"></textarea>
+    <button id="send">发送</button>
+    <p><small>对话只存在本页，刷新会清空。重要模版请复制到你自己的文档。</small></p>
+  </div>
+
+  <script>
+    const chatEl = document.getElementById('chat');
+    const inputEl = document.getElementById('input');
+    const sendBtn = document.getElementById('send');
+
+    let history = [];
+
+    function append(role, text) {
+      const div = document.createElement('div');
+      div.className = 'msg ' + (role === 'user' ? 'user' : 'ai');
+      div.textContent = (role === 'user' ? '你：' : 'AI：') + text;
+      chatEl.appendChild(div);
+      chatEl.scrollTop = chatEl.scrollHeight;
+    }
+
+    async function send() {
+      const text = inputEl.value.trim();
+      if (!text) return;
+
+      append('user', text);
+      history.push({ role: 'user', content: text });
+      inputEl.value = '';
+      inputEl.focus();
+
+      sendBtn.disabled = true;
+      const thinking = document.createElement('div');
+      thinking.className = 'msg ai';
+      thinking.textContent = 'AI：思考中...';
+      chatEl.appendChild(thinking);
+      chatEl.scrollTop = chatEl.scrollHeight;
+
+      try {
+        const res = await fetch('/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ history })
+        });
+        const data = await res.json();
+
+        chatEl.removeChild(thinking);
+
+        const reply = data.reply || '（没有返回内容）';
+        append('assistant', reply);
+        history.push({ role: 'assistant', content: reply });
+      } catch (e) {
+        chatEl.removeChild(thinking);
+        append('assistant', '出错了：' + (e.message || '未知错误'));
+      } finally {
+        sendBtn.disabled = false;
+      }
+    }
+
+    sendBtn.onclick = send;
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        send();
+      }
+    });
+
+    append('assistant', '我是你的AI模板研发总监。先说一件你最想标准化/自动化的事情，我帮你拆成模版和步骤。');
+  </script>
+</body>
+</html>`);
+});
+
+// /chat：处理聊天请求
+app.post("/chat", async (req, res) => {
+  try {
+    const clientHistory = Array.isArray(req.body.history)
+      ? req.body.history
+      : [];
+
+    const messages = [
+      {
+        role: "system",
+        content:
+          "你是一个高级『模板研发总监 + 业务顾问』，服务对象是一位做直播电商与多项目的老板。" +
+          "目标：帮他设计标准化模板（直播话术、选品SOP、AI子代理职责、流程文档）。" +
+          "要求：结构清晰、可执行、语言简洁、别太书面。"
+      },
+      ...clientHistory
+    ];
+
+    const reply = await callOpenAI(messages);
+    res.json({ reply });
+  } catch (err) {
+    res.status(500).json({
+      error: "Chat 出错",
+      detail: err.response?.data?.error?.message || err.message
+    });
+  }
+});
+
+// /demo：简单测试接口，确认OpenAI通不通
+app.get("/demo", async (req, res) => {
+  try {
+    const reply = await callOpenAI([
+      {
+        role: "system",
+        content: "你是一个说话简短的助手。"
+      },
+      {
+        role: "user",
+        content: "简要说明这个AI Orchestrator可以帮主播老板做什么。控制在120字内。"
+      }
+    ]);
+
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.send("【Demo 测试成功】\n" + reply + "\n");
+  } catch (err) {
+    res
+      .status(500)
+      .send(
+        "Demo 出错： " +
+          (err.response?.data?.error?.message || err.message)
+      );
+  }
+});
+
+// 启动服务
+app.listen(PORT, () => {
+  console.log(`AI Orchestrator running on port ${PORT}`);
+});
